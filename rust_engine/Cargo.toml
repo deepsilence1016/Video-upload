@@ -1,0 +1,57 @@
+[package]
+name        = "vision_agent_core"
+version     = "1.0.0"
+edition     = "2021"
+description = "High-performance Rust core for Vision Agent Framework"
+license     = "MIT"
+
+# Build for Android (cross-compiled)
+# cargo build --target aarch64-linux-android --release
+
+[lib]
+name    = "vision_agent_core"
+crate-type = ["cdylib", "staticlib"]
+
+[dependencies]
+# Logging for Android
+android_logger = "0.14"
+log            = "0.4"
+
+# Async runtime (lightweight for embedded)
+tokio = { version = "1.37", features = ["rt", "time", "sync", "io-util"], default-features = false }
+
+# Serialization
+serde      = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Lock-free data structures
+crossbeam-channel = "0.5"
+crossbeam-queue   = "0.3"
+dashmap           = "5.5"   # Concurrent HashMap
+
+# Metrics
+prometheus = { version = "0.13", default-features = false, features = ["process"] }
+
+# Crypto (for secure memory)
+ring = "0.17"
+
+# Error handling
+thiserror = "1.0"
+anyhow    = "1.0"
+
+
+# JNI bridge
+jni = { version = "0.21", features = ["invocation"] }
+
+[profile.release]
+opt-level     = 3
+lto           = "fat"        # Full LTO — smaller, faster binary
+codegen-units = 1            # Single codegen unit for max optimization
+panic         = "abort"      # No unwind, smaller binary
+strip         = true         # Strip debug symbols
+debug         = false
+overflow-checks = false      # Performance-critical, checked in debug
+
+[profile.dev]
+opt-level = 1
+debug     = true

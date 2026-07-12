@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    file_paths.xml
+    FileProvider path configuration.
+    Referenced in AndroidManifest.xml by androidx.core.content.FileProvider.
+    Used for secure sharing of log files and crash reports.
+-->
+<paths xmlns:android="http://schemas.android.com/apk/res/android">
+    <!-- External files dir: /sdcard/Android/data/com.visionagent.app/files/ -->
+    <external-files-path
+        name="external_files"
+        path="." />
+
+    <!-- Internal files dir: /data/data/com.visionagent.app/files/ -->
+    <files-path
+        name="internal_files"
+        path="." />
+
+    <!-- Cache dir: /data/data/com.visionagent.app/cache/ -->
+    <cache-path
+        name="cache"
+        path="." />
+</paths>

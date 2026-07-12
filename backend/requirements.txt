@@ -1,0 +1,40 @@
+# Vision Agent Backend Dependencies
+# Python 3.11+
+
+# Web Framework
+fastapi==0.111.0
+uvicorn[standard]==0.30.1
+httptools==0.6.1
+uvloop==0.19.0
+
+# Data Validation
+pydantic==2.7.4
+pydantic-settings==2.3.4
+
+# Database
+sqlalchemy==2.0.31
+asyncpg==0.29.0            # Async PostgreSQL driver
+alembic==1.13.2            # DB migrations
+
+# Cache
+redis==5.0.6               # Async Redis client
+
+# ML / AI
+onnxruntime==1.18.1        # ONNX inference
+numpy==1.26.4
+Pillow==10.3.0             # Image processing
+
+# Utilities
+python-multipart==0.0.9    # File upload support
+python-jose[cryptography]==3.3.0   # JWT (if needed)
+passlib[bcrypt]==1.7.4     # Password hashing
+
+# Logging
+structlog==24.2.0
+
+# Testing
+pytest==8.2.2
+pytest-asyncio==0.23.7
+httpx==0.27.0              # Async HTTP client for tests
+prometheus_client==0.21.0
+psutil==6.0.0

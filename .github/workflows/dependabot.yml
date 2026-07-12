@@ -1,0 +1,131 @@
+# ============================================================
+# Dependabot — Automated Dependency Updates
+#
+# Checks for updates:
+# - Gradle (Android) dependencies
+# - Cargo (Rust) dependencies  
+# - pip (Python) dependencies
+# - GitHub Actions versions
+#
+# Creates PRs automatically with:
+# - Version bump
+# - Changelog link
+# - Security advisory notes
+# - Auto-merge for patch updates (if CI passes)
+# ============================================================
+
+version: 2
+
+updates:
+
+  # ── Gradle (Android + Kotlin) ───────────────────────────────
+  - package-ecosystem: "gradle"
+    directory: "/android"
+    schedule:
+      interval: "weekly"
+      day:      "monday"
+      time:     "06:00"
+      timezone: "Asia/Kolkata"
+    open-pull-requests-limit: 5
+    groups:
+      jetpack:
+        patterns:
+          - "androidx.*"
+          - "com.google.dagger:hilt*"
+      kotlin:
+        patterns:
+          - "org.jetbrains.kotlin*"
+          - "org.jetbrains.kotlinx*"
+      testing:
+        patterns:
+          - "junit*"
+          - "io.mockk*"
+          - "app.cash.turbine*"
+    labels:
+      - "dependencies"
+      - "android"
+    commit-message:
+      prefix: "deps(android)"
+    reviewers:
+      - "project-maintainer"
+    ignore:
+      # Pin major versions — review manually
+      - dependency-name: "com.google.dagger:hilt-android"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "androidx.room:room-runtime"
+        update-types: ["version-update:semver-major"]
+
+  # ── Cargo (Rust) ─────────────────────────────────────────────
+  - package-ecosystem: "cargo"
+    directory: "/rust_engine"
+    schedule:
+      interval: "weekly"
+      day:      "monday"
+      time:     "06:00"
+      timezone: "Asia/Kolkata"
+    open-pull-requests-limit: 3
+    groups:
+      async:
+        patterns:
+          - "tokio"
+          - "crossbeam*"
+      serialization:
+        patterns:
+          - "serde*"
+    labels:
+      - "dependencies"
+      - "rust"
+    commit-message:
+      prefix: "deps(rust)"
+
+  # ── pip (Python Backend) ──────────────────────────────────────
+  - package-ecosystem: "pip"
+    directory: "/backend"
+    schedule:
+      interval: "weekly"
+      day:      "tuesday"
+      time:     "06:00"
+      timezone: "Asia/Kolkata"
+    open-pull-requests-limit: 5
+    groups:
+      fastapi:
+        patterns:
+          - "fastapi"
+          - "uvicorn*"
+          - "pydantic*"
+      database:
+        patterns:
+          - "sqlalchemy*"
+          - "asyncpg"
+          - "alembic"
+      security:
+        patterns:
+          - "bandit"
+          - "safety"
+    labels:
+      - "dependencies"
+      - "python"
+    commit-message:
+      prefix: "deps(python)"
+    ignore:
+      # Pin major versions
+      - dependency-name: "fastapi"
+        update-types: ["version-update:semver-major"]
+
+  # ── GitHub Actions ────────────────────────────────────────────
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day:      "wednesday"
+    open-pull-requests-limit: 5
+    groups:
+      actions:
+        patterns:
+          - "actions/*"
+          - "github/*"
+    labels:
+      - "dependencies"
+      - "ci-cd"
+    commit-message:
+      prefix: "deps(actions)"

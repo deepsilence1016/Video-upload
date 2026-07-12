@@ -1,0 +1,8 @@
+# rustfmt configuration for Vision Agent Rust Engine
+# Only stable options — nightly options cause "unknown option" errors on stable toolchain
+
+# Allow wider lines — our comment separators and JNI function signatures exceed default 100
+max_width = 120
+
+# Edition
+edition = "2021"

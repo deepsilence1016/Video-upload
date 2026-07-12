@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+
+    <!--
+        FIX THEME-CRASH: AppCompatActivity REQUIRES a Theme.AppCompat or
+        Theme.MaterialComponents parent. Using android:Theme.Material.*
+        causes "IllegalStateException: You need to use a Theme.AppCompat"
+        crash 2-3 seconds after launch (after Hilt injection completes).
+    -->
+    <style name="Theme.VisionAgent" parent="Theme.AppCompat.NoActionBar">
+        <item name="colorPrimary">#1A237E</item>
+        <item name="colorPrimaryDark">#000051</item>
+        <item name="colorAccent">#536DFE</item>
+        <item name="android:statusBarColor">#000051</item>
+        <item name="android:navigationBarColor">#0A0A0A</item>
+        <item name="android:windowBackground">#0A0A0A</item>
+        <item name="android:windowNoTitle">true</item>
+        <item name="android:windowFullscreen">false</item>
+        <item name="android:hardwareAccelerated">true</item>
+    </style>
+
+    <style name="Theme.VisionAgent.Launch" parent="Theme.VisionAgent">
+        <item name="android:windowBackground">@drawable/splash_background</item>
+        <item name="android:windowFullscreen">true</item>
+    </style>
+
+</resources>

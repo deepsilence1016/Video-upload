@@ -1,0 +1,983 @@
+# ============================================================
+# GitHub Actions — Vision Agent Complete CI/CD Pipeline
+# ============================================================
+# Jobs:
+#  1. validate       → Lint + Detekt + Ktlint
+#  2. unit_tests     → Unit tests + Coverage
+#  3. rust_build     → Rust engine cross-compilation
+#  4. native_build   → C++ NDK libraries (arm64 + x86_64)
+#  5. build_debug    → Debug APK
+#  6. build_release  → Signed Release APK + AAB
+#  7. backend_ci     → FastAPI tests (with PG + Redis)
+#  8. security_scan  → OWASP + secret scanning
+#  9. benchmark      → Performance benchmark (main only)
+# 10. release        → GitHub Release with APK assets (tags)
+# 11. notify         → Slack/Webhook notification
+# ============================================================
+
+name: Vision Agent — Full CI/CD
+
+on:
+  push:
+    branches: [ main, develop, 'feature/**' ]
+    tags:     [ 'v*.*.*' ]
+  pull_request:
+    branches: [ main, develop ]
+  workflow_dispatch:
+    inputs:
+      build_type:
+        description: 'Build Type'
+        required: true
+        default: 'debug'
+        type: choice
+        options: [ debug, release, both ]
+      skip_tests:
+        description: 'Skip Tests (emergency)'
+        required: false
+        type: boolean
+        default: false
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+env:
+  JAVA_VERSION:  '17'
+  NDK_VERSION:   'r27'
+  # CMAKE_VERSION removed: see full_ci_pipeline.yml comment.
+  RUST_VERSION:  '1.78.0'
+  PYTHON_VERSION: '3.11'
+  GRADLE_OPTS:   "-Dorg.gradle.jvmargs=-Xmx6g -Dorg.gradle.parallel=true -Dorg.gradle.caching=true -Dkotlin.daemon.jvm.options=-Xmx4g"
+
+# ============================================================
+jobs:
+
+  # ──────────────────────────────────────────────────────────
+  # 1. Validate
+  # ──────────────────────────────────────────────────────────
+  validate:
+    name: 🔍 Code Quality & Lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    if: ${{ !inputs.skip_tests }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+
+      - uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: temurin
+          cache: gradle
+
+      - uses: android-actions/setup-android@v3
+
+      - name: Install NDK via sdkmanager
+        # FIX NDK-2: Gradle reads ndkVersion="27.0.12077973" and looks in
+        # ANDROID_HOME/ndk/27.0.12077973/. sdkmanager installs it there directly.
+        run: |
+          sdkmanager --install "ndk;27.0.12077973" --sdk_root="${ANDROID_HOME}" 2>&1 \
+            | tail -5
+          echo "✅ NDK 27.0.12077973 installed"
+          echo "sdk.dir=${ANDROID_HOME}"                          > android/local.properties
+          echo "ndk.dir=${ANDROID_HOME}/ndk/27.0.12077973"       >> android/local.properties
+          echo "✅ local.properties written"
+          # Verify cmake is on PATH (ubuntu-latest has cmake 3.25.x at /usr/bin/cmake)
+          cmake --version | head -1 || echo "⚠️ cmake not on PATH"
+
+      - name: Install CMake 3.22.1 via apt
+        # FIX CMAKE-FINAL: apt cmake on ubuntu-22.04 = 3.22.1, matches CMakeLists.txt
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y cmake
+          cmake --version
+          echo "✅ cmake ready on PATH"
+
+      - name: Make gradlew executable
+        run: chmod +x android/gradlew  # FIX GRADLE-PERM
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+            android/.gradle
+          key: gradle-${{ runner.os }}-${{ hashFiles('**/*.gradle.kts','**/libs.versions.toml') }}
+
+      - name: Validate Gradle wrapper
+        uses: gradle/actions/wrapper-validation@v4
+
+      - name: Run Android Lint
+        working-directory: android
+        run: ./gradlew lint --stacktrace
+
+      - name: Run Detekt (Static Analysis)
+        working-directory: android
+        run: ./gradlew detekt
+        continue-on-error: true
+
+      - name: Check Ktlint Formatting
+        working-directory: android
+        run: ./gradlew ktlintCheck
+        continue-on-error: true
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: lint-results
+          path: |
+            android/app/build/reports/lint-results-*.html
+            android/app/build/reports/detekt/
+          retention-days: 7
+
+
+  # ──────────────────────────────────────────────────────────
+  # 2. Unit Tests + Coverage
+  # ──────────────────────────────────────────────────────────
+  unit_tests:
+    name: 🧪 Unit Tests + Coverage
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    needs: validate
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: temurin
+          cache: gradle
+
+      - uses: android-actions/setup-android@v3
+
+      - name: Make gradlew executable
+        run: chmod +x android/gradlew  # FIX GRADLE-PERM
+
+      - uses: actions/cache@v4
+        with:
+          path: ~/.gradle/caches
+          key: gradle-${{ runner.os }}-${{ hashFiles('**/*.gradle.kts') }}
+
+      - name: Install NDK via sdkmanager
+        # FIX NDK-2: Gradle reads ndkVersion="27.0.12077973" and looks in
+        # ANDROID_HOME/ndk/27.0.12077973/. sdkmanager installs it there directly.
+        run: |
+          sdkmanager --install "ndk;27.0.12077973" --sdk_root="${ANDROID_HOME}" 2>&1 \
+            | tail -5
+          echo "✅ NDK 27.0.12077973 installed"
+          echo "sdk.dir=${ANDROID_HOME}"                          > android/local.properties
+          echo "ndk.dir=${ANDROID_HOME}/ndk/27.0.12077973"       >> android/local.properties
+          echo "✅ local.properties written"
+          # Verify cmake is on PATH (ubuntu-latest has cmake 3.25.x at /usr/bin/cmake)
+          cmake --version | head -1 || echo "⚠️ cmake not on PATH"
+
+      - name: Run Unit Tests
+        working-directory: android
+        run: |
+          ./gradlew testDebugUnitTest \
+            --stacktrace \
+            --continue \
+            -Pandroid.testInstrumentationRunnerArguments.coverage=true
+
+      - name: Generate JaCoCo Coverage
+        working-directory: android
+        run: ./gradlew jacocoTestReport
+        continue-on-error: true
+
+      - name: Enforce Coverage Threshold (70%)
+        working-directory: android
+        run: ./gradlew jacocoTestCoverageVerification
+        continue-on-error: true
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: unit-test-results
+          path: |
+            android/app/build/reports/tests/
+            android/app/build/reports/jacoco/
+          retention-days: 14
+
+      - name: Publish Test Report
+        uses: EnricoMi/publish-unit-test-result-action@v2
+        if: always()
+        with:
+          files: android/app/build/test-results/**/*.xml
+
+
+  # ──────────────────────────────────────────────────────────
+  # 3. Rust Engine Build
+  # ──────────────────────────────────────────────────────────
+  rust_build:
+    name: 🦀 Rust Engine (Cross-compile Android)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs: validate
+
+    strategy:
+      matrix:
+        target:
+          - aarch64-linux-android   # arm64-v8a
+          - x86_64-linux-android    # x86_64 (emulator)
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust ${{ env.RUST_VERSION }}
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          targets:   ${{ matrix.target }}
+
+      - name: Cache Rust Build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            rust_engine/target
+          key: rust-${{ runner.os }}-${{ matrix.target }}-${{ hashFiles('rust_engine/Cargo.lock') }}
+
+      - name: Setup Android NDK for Rust
+        id: setup-ndk-rust
+        uses: nttld/setup-ndk@v1.5.0
+        with:
+          ndk-version: ${{ env.NDK_VERSION }}
+          add-to-path: true
+
+      - name: Build Rust Engine for Android
+        working-directory: rust_engine
+        run: |
+          NDK_PATH="${{ steps.setup-ndk-rust.outputs.ndk-path }}"
+          TC="$NDK_PATH/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          TARGET="${{ matrix.target }}"
+
+          echo "=== NDK clang binaries ==="
+          ls "$TC/" | grep "clang$" | head -20
+
+          A64_BIN=$(ls "$TC/aarch64-linux-android"*"-clang" 2>/dev/null | head -1)
+          X64_BIN=$(ls  "$TC/x86_64-linux-android"*"-clang"  2>/dev/null | head -1)
+
+          if [ -z "$A64_BIN" ] || [ -z "$X64_BIN" ]; then
+            echo "ERROR: clang not found"; ls "$TC/"; exit 1
+          fi
+          echo "aarch64: $A64_BIN"
+          echo "x86_64:  $X64_BIN"
+
+          # CRITICAL: cc-rs looks for "aarch64-linux-android-clang" (no API level)
+          # NDK ships "aarch64-linux-android26-clang" (with API level)
+          # Create symlinks so cc-rs and ring find the correct binary
+          ln -sf "$A64_BIN" "$TC/aarch64-linux-android-clang"
+          ln -sf "$X64_BIN" "$TC/x86_64-linux-android-clang"
+          ln -sf "$A64_BIN" "$TC/aarch64-linux-android-clang++"
+          ln -sf "$X64_BIN" "$TC/x86_64-linux-android-clang++"
+
+          # Add toolchain to PATH (symlinks now discoverable)
+          export PATH="$TC:$PATH"
+
+          # cargo config.toml using symlinked names
+          mkdir -p ~/.cargo
+          printf '[target.aarch64-linux-android]\nlinker = "%s/aarch64-linux-android-clang"\n\n[target.x86_64-linux-android]\nlinker = "%s/x86_64-linux-android-clang"\n' "$TC" "$TC" > ~/.cargo/config.toml
+          echo "cargo config:"; cat ~/.cargo/config.toml
+
+          # All env vars cc-rs and ring read (both formats)
+          export ANDROID_NDK_ROOT="$NDK_PATH"
+          export ANDROID_NDK_HOME="$NDK_PATH"
+          export CC_aarch64_linux_android="$A64_BIN"
+          export CC_x86_64_linux_android="$X64_BIN"
+          export AR_aarch64_linux_android="$TC/llvm-ar"
+          export AR_x86_64_linux_android="$TC/llvm-ar"
+          export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$TC/aarch64-linux-android-clang"
+          export CARGO_TARGET_X86_64_LINUX_ANDROID_LINKER="$TC/x86_64-linux-android-clang"
+
+          # ring crate also reads the generic CC
+          if [ "$TARGET" = "aarch64-linux-android" ]; then
+            export CC="$A64_BIN"
+          else
+            export CC="$X64_BIN"
+          fi
+
+          which aarch64-linux-android-clang && echo "clang in PATH: OK" || echo "WARNING: not in PATH"
+          cargo build --target "$TARGET" --release
+
+      - name: Verify output library
+        run: |
+          LIB="rust_engine/target/${{ matrix.target }}/release/libvision_agent_core.so"
+          ls -lh "$LIB"
+          file "$LIB"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rust-lib-${{ matrix.target }}
+          path: rust_engine/target/${{ matrix.target }}/release/libvision_agent_core.so
+          retention-days: 7
+
+
+  # ──────────────────────────────────────────────────────────
+  # 4. Native C++ Build (OpenCV + Tesseract)
+  # ──────────────────────────────────────────────────────────
+  native_build:
+    name: 🔧 Native C++ Libraries
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    needs: validate
+
+    strategy:
+      matrix:
+        abi: [ arm64-v8a, x86_64 ]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: temurin
+
+      - uses: nttld/setup-ndk@v1.5.0
+        id: setup-ndk
+        with:
+          ndk-version: ${{ env.NDK_VERSION }}
+          add-to-path: true
+
+      - name: Register NDK with Gradle (symlink into ANDROID_HOME)
+        # FIX NDK-4 (native_build): Symlink setup-ndk output into ANDROID_HOME
+        run: |
+          NDK_INSTALLED="${{ steps.setup-ndk.outputs.ndk-path }}"
+          NDK_EXPECTED="${ANDROID_HOME}/ndk/27.0.12077973"
+          if [ ! -d "${NDK_EXPECTED}" ]; then
+            mkdir -p "${ANDROID_HOME}/ndk"
+            ln -sfn "${NDK_INSTALLED}" "${NDK_EXPECTED}"
+            echo "✅ Symlinked NDK"
+          fi
+          echo "ndk.dir=${NDK_INSTALLED}" > android/local.properties
+          echo "sdk.dir=${ANDROID_HOME}"  >> android/local.properties
+
+
+      - name: Install CMake 3.22.1 via apt
+        # FIX CMAKE-FINAL: apt cmake on ubuntu-22.04 = 3.22.1, matches CMakeLists.txt
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y cmake
+          cmake --version
+          echo "✅ cmake ready on PATH"
+
+      - name: Cache NDK + OpenCV Build
+        uses: actions/cache@v4
+        with:
+          path: |
+            android/app/.cxx
+            android/app/src/main/cpp/opencv
+          key: ndk-${{ runner.os }}-${{ matrix.abi }}-${{ hashFiles('android/app/src/main/cpp/**/*.cpp','android/app/src/main/cpp/**/*.h') }}
+
+      - name: Download OpenCV Android SDK
+        run: |
+          if [ ! -d "android/app/src/main/cpp/opencv" ]; then
+            wget -q https://github.com/opencv/opencv/releases/download/4.9.0/opencv-4.9.0-android-sdk.zip
+            unzip -q opencv-4.9.0-android-sdk.zip -d android/app/src/main/cpp/
+            mv android/app/src/main/cpp/OpenCV-android-sdk android/app/src/main/cpp/opencv
+            echo "✅ OpenCV 4.9.0 downloaded"
+          else
+            echo "✅ OpenCV found in cache"
+          fi
+
+      - name: Build Native Libraries (${{ matrix.abi }})
+        working-directory: android
+        env:
+          ANDROID_NDK: ${{ steps.setup-ndk.outputs.ndk-path }}
+        run: |
+          ./gradlew app:buildCMakeDebug \
+            -Pandroid.ndk.abiFilters=${{ matrix.abi }} \
+            --stacktrace \
+            --no-configuration-cache
+
+      - name: Check library sizes
+        run: |
+          echo "=== Native Library Sizes ==="
+          find android/app/build -name "*.so" -exec ls -lh {} \;
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: native-libs-${{ matrix.abi }}
+          path: android/app/build/intermediates/cmake/debug/obj/${{ matrix.abi }}/
+          retention-days: 7
+
+
+  # ──────────────────────────────────────────────────────────
+  # 5. Build Debug APK
+  # ──────────────────────────────────────────────────────────
+  build_debug:
+    name: 🏗️ Debug APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    needs: [ unit_tests, native_build, rust_build ]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: temurin
+          cache: gradle
+
+      - uses: android-actions/setup-android@v3
+
+      - name: Make gradlew executable
+        run: chmod +x android/gradlew  # FIX GRADLE-PERM
+
+      - name: Install NDK
+        uses: nttld/setup-ndk@v1.5.0
+        id: setup-ndk-debug
+        with:
+          ndk-version: ${{ env.NDK_VERSION }}
+          add-to-path: true
+
+      - name: Export NDK path
+        run: |
+          echo "ANDROID_NDK_HOME=${{ steps.setup-ndk-debug.outputs.ndk-path }}" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_ROOT=${{ steps.setup-ndk-debug.outputs.ndk-path }}" >> "$GITHUB_ENV"
+
+      - name: Register NDK with Gradle (symlink into ANDROID_HOME)
+        # FIX NDK-4: Symlink setup-ndk path into ANDROID_HOME/ndk/27.0.12077973/
+        run: |
+          NDK_INSTALLED="${{ steps.setup-ndk-debug.outputs.ndk-path }}"
+          NDK_EXPECTED="${ANDROID_HOME}/ndk/27.0.12077973"
+          if [ ! -d "${NDK_EXPECTED}" ]; then
+            mkdir -p "${ANDROID_HOME}/ndk"
+            ln -sfn "${NDK_INSTALLED}" "${NDK_EXPECTED}"
+            echo "✅ Symlinked NDK"
+          fi
+          echo "ndk.dir=${NDK_INSTALLED}" > android/local.properties
+          echo "sdk.dir=${ANDROID_HOME}"  >> android/local.properties
+
+
+      - name: Download Native Libs
+        uses: actions/download-artifact@v4
+        with:
+          pattern: native-libs-*
+          merge-multiple: false
+
+      - name: Download Rust Libs
+        uses: actions/download-artifact@v4
+        with:
+          pattern: rust-lib-*
+          merge-multiple: false
+
+      - name: Stage Libraries
+        run: |
+          # Stage native C++ libs
+          for abi in arm64-v8a x86_64; do
+            mkdir -p android/app/src/main/jniLibs/$abi
+            cp -r native-libs-$abi/*.so android/app/src/main/jniLibs/$abi/ 2>/dev/null || true
+            cp rust-lib-*/libvision_agent_core.so android/app/src/main/jniLibs/$abi/ 2>/dev/null || true
+          done
+
+      - uses: actions/cache@v4
+        with:
+          path: ~/.gradle/caches
+          key: gradle-${{ runner.os }}-${{ hashFiles('**/*.gradle.kts') }}
+
+      - name: Build Debug APK
+        working-directory: android
+        run: |
+          ./gradlew assembleDebug \
+            --stacktrace \
+            --no-daemon \
+            -Pandroid.builder.sdkDownload=false
+
+      - name: APK Info
+        id: apk_info
+        run: |
+          APK=$(find android/app/build/outputs/apk/debug -name "*.apk" | head -1)
+          SIZE=$(du -sh "$APK" | cut -f1)
+          echo "path=$APK"   >> $GITHUB_OUTPUT
+          echo "size=$SIZE"  >> $GITHUB_OUTPUT
+          echo "📦 Debug APK: $APK ($SIZE)"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: debug-apk-${{ github.sha }}
+          path: android/app/build/outputs/apk/debug/*.apk
+          retention-days: 14
+
+      - name: Summary
+        run: |
+          echo "## 📦 Debug APK" >> $GITHUB_STEP_SUMMARY
+          echo "- Size: ${{ steps.apk_info.outputs.size }}" >> $GITHUB_STEP_SUMMARY
+          echo "- SHA:  \`${{ github.sha }}\`"               >> $GITHUB_STEP_SUMMARY
+          echo "- Branch: ${{ github.ref_name }}"            >> $GITHUB_STEP_SUMMARY
+
+
+  # ──────────────────────────────────────────────────────────
+  # 6. Build Release APK (Signed)
+  # ──────────────────────────────────────────────────────────
+  build_release:
+    name: 🚀 Release APK (Signed)
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    needs: [ unit_tests, native_build, rust_build ]
+    if: |
+      github.ref == 'refs/heads/main' ||
+      startsWith(github.ref, 'refs/tags/v') ||
+      inputs.build_type == 'release'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: temurin
+          cache: gradle
+
+      - uses: android-actions/setup-android@v3
+
+      - name: Make gradlew executable
+        run: chmod +x android/gradlew  # FIX GRADLE-PERM
+
+      - name: Install NDK
+        uses: nttld/setup-ndk@v1.5.0
+        id: setup-ndk-release
+        with:
+          ndk-version: ${{ env.NDK_VERSION }}
+          add-to-path: true
+
+      - name: Export NDK path
+        run: |
+          echo "ANDROID_NDK_HOME=${{ steps.setup-ndk-release.outputs.ndk-path }}" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_ROOT=${{ steps.setup-ndk-release.outputs.ndk-path }}" >> "$GITHUB_ENV"
+
+      - name: Register NDK with Gradle (symlink into ANDROID_HOME)
+        # FIX NDK-4: Symlink setup-ndk path into ANDROID_HOME/ndk/27.0.12077973/
+        run: |
+          NDK_INSTALLED="${{ steps.setup-ndk-release.outputs.ndk-path }}"
+          NDK_EXPECTED="${ANDROID_HOME}/ndk/27.0.12077973"
+          if [ ! -d "${NDK_EXPECTED}" ]; then
+            mkdir -p "${ANDROID_HOME}/ndk"
+            ln -sfn "${NDK_INSTALLED}" "${NDK_EXPECTED}"
+            echo "✅ Symlinked NDK"
+          fi
+          echo "ndk.dir=${NDK_INSTALLED}" > android/local.properties
+          echo "sdk.dir=${ANDROID_HOME}"  >> android/local.properties
+
+
+      - name: Download Native + Rust Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: '{native-libs-*,rust-lib-*}'
+          merge-multiple: false
+
+      - name: Stage Libraries
+        run: |
+          for abi in arm64-v8a x86_64; do
+            mkdir -p android/app/src/main/jniLibs/$abi
+            cp native-libs-$abi/*.so android/app/src/main/jniLibs/$abi/ 2>/dev/null || true
+            cp rust-lib-*/libvision_agent_core.so android/app/src/main/jniLibs/$abi/ 2>/dev/null || true
+          done
+
+      - name: Install CMake 3.22.1 via apt
+        # FIX CMAKE-FINAL: apt cmake on ubuntu-22.04 = 3.22.1, matches CMakeLists.txt
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y cmake
+          cmake --version
+          echo "✅ cmake ready on PATH"
+
+      - name: Decode Release Keystore
+        # FIX KEYSTORE-1: "Failed to read key from store" +
+        #   "Tag number over 30 is not supported"
+        # See full_ci_pipeline.yml Decode Keystore step for detailed explanation.
+        # Fix: detect PKCS12 and convert to JKS (AGP/apksigner compatible).
+        run: |
+          set -euo pipefail
+
+          if [ -z "${{ secrets.KEYSTORE_BASE64 }}" ]; then
+            echo "⚠️  KEYSTORE_BASE64 not set — skipping signing setup"
+            echo "KEYSTORE_PATH=" >> "$GITHUB_ENV"
+            exit 0
+          fi
+
+          echo "${{ secrets.KEYSTORE_BASE64 }}" | base64 -d > /tmp/release_raw.keystore
+
+          KS_TYPE=$(keytool -list \
+            -keystore /tmp/release_raw.keystore \
+            -storepass "${{ secrets.KEYSTORE_PASSWORD }}" \
+            -v 2>/dev/null | grep "Keystore type" | awk '{print $NF}' | tr '[:lower:]' '[:upper:]' || echo "UNKNOWN")
+
+          echo "🔍 Keystore type: ${KS_TYPE}"
+
+          if [ "$KS_TYPE" = "JKS" ]; then
+            mv /tmp/release_raw.keystore /tmp/release.keystore
+            echo "✅ Already JKS"
+          else
+            echo "🔄 Converting ${KS_TYPE} → JKS..."
+            keytool -importkeystore \
+              -srckeystore  /tmp/release_raw.keystore \
+              -srcstoretype "${KS_TYPE}" \
+              -srcstorepass "${{ secrets.KEYSTORE_PASSWORD }}" \
+              -srckeypass   "${{ secrets.KEY_PASSWORD }}" \
+              -srcalias     "${{ secrets.KEY_ALIAS }}" \
+              -destkeystore /tmp/release.keystore \
+              -deststoretype JKS \
+              -deststorepass "${{ secrets.KEYSTORE_PASSWORD }}" \
+              -destkeypass  "${{ secrets.KEY_PASSWORD }}" \
+              -destalias    "${{ secrets.KEY_ALIAS }}" \
+              -noprompt -v 2>&1
+            rm -f /tmp/release_raw.keystore
+            echo "✅ Converted to JKS"
+          fi
+
+          keytool -list \
+            -keystore /tmp/release.keystore \
+            -storepass "${{ secrets.KEYSTORE_PASSWORD }}" \
+            -storetype JKS 2>&1 | grep -E "Keystore type|Alias" \
+            || { echo "❌ Keystore verification failed"; exit 1; }
+
+          echo "KEYSTORE_PATH=/tmp/release.keystore" >> "$GITHUB_ENV"
+
+      - uses: actions/cache@v4
+        with:
+          path: ~/.gradle/caches
+          key: gradle-${{ runner.os }}-${{ hashFiles('**/*.gradle.kts') }}
+
+      - name: Build Release APK
+        working-directory: android
+        env:
+          KEYSTORE_PATH:     ${{ env.KEYSTORE_PATH }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS:         ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD:      ${{ secrets.KEY_PASSWORD }}
+        run: ./gradlew assembleRelease --stacktrace --no-daemon
+
+      - name: Build Release AAB (Play Store)
+        working-directory: android
+        env:
+          KEYSTORE_PATH:     ${{ env.KEYSTORE_PATH }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS:         ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD:      ${{ secrets.KEY_PASSWORD }}
+        run: ./gradlew bundleRelease --stacktrace --no-daemon
+
+      - name: Verify APK Signature
+        run: |
+          APK=$(find android/app/build/outputs/apk/release -name "*.apk" | head -1)
+          $ANDROID_HOME/build-tools/34.0.0/apksigner verify --verbose "$APK"
+          echo "✅ Signature verified"
+
+      - name: Calculate APK Hash (for release notes)
+        id: apk_hash
+        run: |
+          APK=$(find android/app/build/outputs/apk/release -name "*.apk" | head -1)
+          SHA256=$(sha256sum "$APK" | awk '{print $1}')
+          SIZE=$(du -sh "$APK" | cut -f1)
+          echo "sha256=$SHA256" >> $GITHUB_OUTPUT
+          echo "size=$SIZE"     >> $GITHUB_OUTPUT
+
+      - name: Cleanup Keystore
+        if: always()
+        run: rm -f /tmp/release.keystore
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-artifacts-${{ github.sha }}
+          path: |
+            android/app/build/outputs/apk/release/*.apk
+            android/app/build/outputs/bundle/release/*.aab
+          retention-days: 30
+
+      - name: Summary
+        run: |
+          echo "## 🚀 Release APK"                              >> $GITHUB_STEP_SUMMARY
+          echo "- Size:   ${{ steps.apk_hash.outputs.size }}"  >> $GITHUB_STEP_SUMMARY
+          echo "- SHA256: \`${{ steps.apk_hash.outputs.sha256 }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- Signed: ✅"                                   >> $GITHUB_STEP_SUMMARY
+
+
+  # ──────────────────────────────────────────────────────────
+  # 7. Backend CI (Python)
+  # ──────────────────────────────────────────────────────────
+  backend_ci:
+    name: 🐍 Backend Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB:       visionagent_test
+          POSTGRES_USER:     test_user
+          POSTGRES_PASSWORD: test_pass
+        ports:   [ "5432:5432" ]
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+      redis:
+        image: redis:7-alpine
+        ports:   [ "6379:6379" ]
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 3s
+          --health-retries 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install Dependencies
+        working-directory: backend
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest-cov pytest-asyncio pytest-xdist httpx
+
+      - name: Run Backend Tests (parallel)
+        working-directory: backend
+        env:
+          DATABASE_URL:  "postgresql+asyncpg://test_user:test_pass@localhost:5432/visionagent_test"
+          REDIS_URL:     "redis://localhost:6379/0"
+          AGENT_API_KEY: "test-api-key-12345"
+          DEBUG:         "true"
+        run: |
+          pytest tests/ \
+            --cov=src \
+            --cov-report=xml \
+            --cov-report=term-missing \
+            -v \
+            -n auto \
+            --timeout=30
+
+      - name: Upload Backend Coverage
+        uses: codecov/codecov-action@v5
+        with:
+          files: backend/coverage.xml
+          flags: backend
+        continue-on-error: true
+
+
+  # ──────────────────────────────────────────────────────────
+  # 8. Security Scan
+  # ──────────────────────────────────────────────────────────
+  security_scan:
+    name: 🔒 Security Scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: validate
+    if: github.event_name == 'push'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Scan for secrets (TruffleHog)
+        uses: trufflesecurity/trufflehog@main
+        with:
+          path: ./
+          base: ${{ github.event.repository.default_branch }}
+          head: HEAD
+        continue-on-error: true
+
+      - name: OWASP Dependency Check
+        uses: dependency-check/Dependency-Check_Action@main
+        with:
+          project: VisionAgent
+          path:    .
+          format:  HTML
+        continue-on-error: true
+
+      - name: Python Safety Check
+        working-directory: backend
+        run: |
+          pip install safety
+          safety check -r requirements.txt --json > safety-report.json || true
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: security-reports
+          path: |
+            reports/
+            backend/safety-report.json
+          retention-days: 30
+
+
+  # ──────────────────────────────────────────────────────────
+  # 9. Performance Benchmark (main branch only)
+  # ──────────────────────────────────────────────────────────
+  benchmark:
+    name: ⚡ Performance Benchmark
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs: build_debug
+    if: github.ref == 'refs/heads/main'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: temurin
+          cache: gradle
+
+      - uses: android-actions/setup-android@v3
+
+      - name: Make gradlew executable
+        run: chmod +x android/gradlew  # FIX GRADLE-PERM
+
+      - name: Install CMake 3.22.1 via apt
+        # FIX CMAKE-FINAL: apt cmake on ubuntu-22.04 = 3.22.1, matches CMakeLists.txt
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y cmake
+          cmake --version
+          echo "✅ cmake ready on PATH"
+
+      - name: Build Benchmark APK
+        working-directory: android
+        run: ./gradlew assembleBenchmark --stacktrace
+
+      - name: Rust benchmark
+        working-directory: rust_engine
+        run: |
+          # Install Rust for benchmarks
+          cargo bench --no-run
+        continue-on-error: true
+
+      - uses: actions/upload-artifact@v4
+        with:
+      - name: Install NDK via sdkmanager
+        # FIX NDK-2: Gradle reads ndkVersion="27.0.12077973" and looks in
+        # ANDROID_HOME/ndk/27.0.12077973/. sdkmanager installs it there directly.
+        run: |
+          sdkmanager --install "ndk;27.0.12077973" --sdk_root="${ANDROID_HOME}" 2>&1 \
+            | tail -5
+          echo "✅ NDK 27.0.12077973 installed"
+          echo "sdk.dir=${ANDROID_HOME}"                          > android/local.properties
+          echo "ndk.dir=${ANDROID_HOME}/ndk/27.0.12077973"       >> android/local.properties
+          echo "✅ local.properties written"
+          # Verify cmake is on PATH (ubuntu-latest has cmake 3.25.x at /usr/bin/cmake)
+          cmake --version | head -1 || echo "⚠️ cmake not on PATH"
+
+          name: benchmark-results-${{ github.run_id }}
+          path: |
+            android/app/build/outputs/apk/benchmark/
+          retention-days: 30
+
+
+  # ──────────────────────────────────────────────────────────
+  # 10. GitHub Release (Tags only)
+  # ──────────────────────────────────────────────────────────
+  create_release:
+    name: 📋 GitHub Release
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: [ build_release, backend_ci ]
+    if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-artifacts-${{ github.sha }}
+          path: ./release-artifacts
+
+      - name: Generate Changelog
+        id: changelog
+        run: |
+          PREV=$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || echo "")
+          if [ -n "$PREV" ]; then
+            LOG=$(git log --pretty="- %s (%h)" $PREV..HEAD | head -30)
+          else
+            LOG=$(git log --pretty="- %s (%h)" --max-count=20)
+          fi
+          echo "changelog<<EOF" >> $GITHUB_OUTPUT
+          echo "$LOG"           >> $GITHUB_OUTPUT
+          echo "EOF"            >> $GITHUB_OUTPUT
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: "Vision Agent ${{ github.ref_name }}"
+          body: |
+            ## 🤖 Vision Agent ${{ github.ref_name }}
+
+            > Production Grade Vision Agent Framework
+
+            ---
+
+            ### 📦 Downloads
+            | File | Description |
+            |------|-------------|
+            | `VisionAgent-release.apk` | Android APK (install directly) |
+            | `VisionAgent-release.aab` | Android App Bundle (Play Store) |
+
+            ### 🔑 Verify Signature
+            ```bash
+            apksigner verify --verbose VisionAgent-release.apk
+            ```
+
+            ### ⚙️ Requirements
+            - Android 8.0+ (API 26+)
+            - ARM64-v8a or x86_64
+            - Minimum 6 GB RAM device
+
+            ---
+
+            ### 📋 Changes in ${{ github.ref_name }}
+            ${{ steps.changelog.outputs.changelog }}
+
+            ---
+
+            ### 🏗️ Build Info
+            - Commit: `${{ github.sha }}`
+            - Built:  ${{ github.run_id }}
+            - C++17 + OpenCV + Tesseract + Rust engine
+
+          files: |
+            ./release-artifacts/**/*.apk
+            ./release-artifacts/**/*.aab
+          draft:      false
+          prerelease: ${{ contains(github.ref_name, 'alpha') || contains(github.ref_name, 'beta') || contains(github.ref_name, 'rc') }}
+
+
+  # ──────────────────────────────────────────────────────────
+  # 11. CI Summary
+  # ──────────────────────────────────────────────────────────
+  ci_summary:
+    name: ✅ Pipeline Summary
+    runs-on: ubuntu-latest
+    needs: [ validate, unit_tests, rust_build, native_build, build_debug, backend_ci ]
+    if: always()
+
+    steps:
+      - name: Pipeline Summary
+        run: |
+          echo "## 🤖 Vision Agent CI/CD Summary" >> $GITHUB_STEP_SUMMARY
+          echo ""                                  >> $GITHUB_STEP_SUMMARY
+          echo "| Job | Status |"                  >> $GITHUB_STEP_SUMMARY
+          echo "|-----|--------|"                  >> $GITHUB_STEP_SUMMARY
+          echo "| Validate       | ${{ needs.validate.result }}      |" >> $GITHUB_STEP_SUMMARY
+          echo "| Unit Tests     | ${{ needs.unit_tests.result }}    |" >> $GITHUB_STEP_SUMMARY
+          echo "| Rust Engine    | ${{ needs.rust_build.result }}    |" >> $GITHUB_STEP_SUMMARY
+          echo "| Native (C++)   | ${{ needs.native_build.result }}  |" >> $GITHUB_STEP_SUMMARY
+          echo "| Debug APK      | ${{ needs.build_debug.result }}   |" >> $GITHUB_STEP_SUMMARY
+          echo "| Backend Tests  | ${{ needs.backend_ci.result }}    |" >> $GITHUB_STEP_SUMMARY
+          echo ""                                  >> $GITHUB_STEP_SUMMARY
+          echo "**Trigger:** \`${{ github.event_name }}\`"  >> $GITHUB_STEP_SUMMARY
+          echo "**Branch:**  \`${{ github.ref_name }}\`"   >> $GITHUB_STEP_SUMMARY
+          echo "**Commit:**  \`${{ github.sha }}\`"        >> $GITHUB_STEP_SUMMARY

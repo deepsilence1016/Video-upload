@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+
+    <!-- App name — shown in launcher and Settings -->
+    <string name="app_name">Vision Agent</string>
+
+    <!-- Accessibility Service strings -->
+    <string name="accessibility_service_label">Vision Agent Accessibility</string>
+    <string name="accessibility_description">
+        Vision Agent uses accessibility services to interact with its own UI,
+        capture screen content, and execute automated actions within the app only.
+        This service is restricted to com.visionagent.app and does not access
+        other applications.
+    </string>
+
+    <!-- Notification strings -->
+    <string name="notification_channel_name">Vision Agent</string>
+    <string name="notification_channel_description">Vision Agent background service notifications</string>
+    <string name="notification_title">Vision Agent Running</string>
+    <string name="notification_text">Agent is active and monitoring</string>
+
+    <!-- General UI -->
+    <string name="ok">OK</string>
+    <string name="cancel">Cancel</string>
+    <string name="error">Error</string>
+    <string name="loading">Loading…</string>
+
+</resources>

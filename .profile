@@ -1,0 +1,2 @@
+# cleaned
+. "$HOME/.cargo/env"

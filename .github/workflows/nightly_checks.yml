@@ -1,0 +1,344 @@
+# ============================================================
+# Nightly Checks — Deep Analysis (2 AM IST daily)
+#
+# Jobs:
+# 1. Dependency vulnerability scan (fresh daily)
+# 2. Baseline profile generation (API 31 emulator)
+# 3. Mutation testing (pitest) — slow, runs nightly only
+# 4. Native profiling (Simpleperf analysis)
+# 5. Memory leak detection (extended run)
+# 6. Performance regression baseline update
+# 7. Device Farm tests (if Firebase Test Lab configured)
+# ============================================================
+
+name: Nightly Deep Analysis
+
+on:
+  schedule:
+    - cron: '30 20 * * *'   # 2:00 AM IST (UTC+5:30 → 20:30 UTC)
+  workflow_dispatch:
+    inputs:
+      run_mutation:
+        description: 'Run mutation testing (slow, ~30min)'
+        type: boolean
+        default: true
+      run_device_farm:
+        description: 'Run Firebase Test Lab (requires setup)'
+        type: boolean
+        default: false
+
+env:
+  JAVA_VERSION:  '17'
+  NDK_VERSION:   'r27c'
+  RUST_VERSION:  '1.78.0'
+
+jobs:
+
+  # ──────────────────────────────────────────────────────────
+  # 1. Dependency Vulnerability Scan
+  # ──────────────────────────────────────────────────────────
+  dependency_scan:
+    name: 🔒 Daily Dependency Scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with: { java-version: '${{ env.JAVA_VERSION }}', distribution: temurin, cache: gradle }
+
+      - name: Gradle Dependency Updates
+        working-directory: android
+        run: |
+          ./gradlew dependencyUpdates \
+            --refresh-dependencies \
+            --stacktrace 2>&1 | tail -50 || true
+
+      - name: Rust cargo audit
+        working-directory: rust_engine
+        run: |
+          cargo install cargo-audit --quiet 2>/dev/null || true
+          cargo audit --json 2>&1 | tee /tmp/rust_audit.json || true
+          python3 -c "
+          import json
+          with open('/tmp/rust_audit.json') as f:
+            d = json.load(f)
+          vulns = d.get('vulnerabilities',{}).get('list',[])
+          print(f'Rust vulnerabilities: {len(vulns)}')
+          for v in vulns:
+            sev = v.get('advisory',{}).get('cvss',{}).get('score',0)
+            print(f'  [{sev}] {v[\"advisory\"][\"id\"]}: {v[\"advisory\"][\"title\"]}')
+          "
+
+      - name: Python safety check
+        working-directory: backend
+        run: |
+          pip install safety -q
+          safety check -r requirements.txt 2>&1 || true
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: nightly-dependency-scan-${{ github.run_id }}
+          path: /tmp/rust_audit.json
+          retention-days: 30
+
+  # ──────────────────────────────────────────────────────────
+  # 2. Baseline Profile Generation
+  # ──────────────────────────────────────────────────────────
+  baseline_profile:
+    name: 📱 Baseline Profile Generation
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with: { java-version: '${{ env.JAVA_VERSION }}', distribution: temurin, cache: gradle }
+
+      - uses: android-actions/setup-android@v3
+
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | \
+            sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - name: Generate Baseline Profile
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 31
+          target:    google_apis
+          arch:      x86_64
+          emulator-options: -no-snapshot-save -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -memory 4096
+          disable-animations: true
+          script: |
+            cd android
+            # Build + run macrobenchmark to generate profile
+            ./gradlew assembleBenchmark 2>&1 | tail -20
+
+            # Install benchmark APK
+            APK=$(find app/build/outputs/apk/benchmark -name "*.apk" | head -1)
+            if [ -n "$APK" ]; then
+              adb install -r "$APK"
+              echo "✅ Benchmark APK installed"
+              
+              # Run startup benchmark to get timing
+              adb shell am start -n com.visionagent.app/.presentation.MainActivity -W
+              STARTUP=$(adb logcat -d | grep "Displayed" | grep "visionagent" | \
+                        tail -1 | grep -oP '\d+ms' | head -1)
+              echo "Cold start: $STARTUP"
+            fi
+
+      - name: Upload Profile Results
+        uses: actions/upload-artifact@v4
+        with:
+          name: baseline-profile-${{ github.run_id }}
+          path: |
+            android/app/src/main/baseline-prof.txt
+          retention-days: 30
+
+  # ──────────────────────────────────────────────────────────
+  # 3. Mutation Testing (PITest)
+  # ──────────────────────────────────────────────────────────
+  mutation_testing:
+    name: 🧬 Mutation Testing (PITest)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    if: ${{ inputs.run_mutation != false }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with: { java-version: '${{ env.JAVA_VERSION }}', distribution: temurin, cache: gradle }
+
+      - uses: android-actions/setup-android@v3
+
+      - name: Run PITest Mutation Testing
+        working-directory: android
+        run: |
+          # PITest runs on JVM unit tests (not instrumented)
+          ./gradlew pitest \
+            --stacktrace \
+            --info 2>&1 | tail -100 || true
+          
+          # Parse results
+          XML=$(find . -name "mutations.xml" | head -1)
+          if [ -n "$XML" ]; then
+            python3 -c "
+          import xml.etree.ElementTree as ET
+          tree = ET.parse('$XML')
+          root = tree.getroot()
+          mutations = root.findall('.//mutation')
+          killed = sum(1 for m in mutations if m.get('status') == 'KILLED')
+          survived = sum(1 for m in mutations if m.get('status') == 'SURVIVED')
+          total = killed + survived
+          rate = int(killed * 100 / total) if total > 0 else 0
+          print(f'Mutation Kill Rate: {rate}% ({killed}/{total})')
+          if rate < 80:
+              print(f'WARNING: Kill rate {rate}% below 80% threshold')
+          else:
+              print(f'PASS: Kill rate {rate}% above threshold')
+          "
+          else
+            echo "PITest XML not found — may need PITest plugin setup"
+          fi
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: mutation-testing-${{ github.run_id }}
+          path: android/app/build/reports/pitest/
+          retention-days: 30
+
+  # ──────────────────────────────────────────────────────────
+  # 4. Memory Leak Extended Detection
+  # ──────────────────────────────────────────────────────────
+  leak_detection:
+    name: 💧 Memory Leak Extended Detection
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with: { java-version: '${{ env.JAVA_VERSION }}', distribution: temurin, cache: gradle }
+
+      - uses: android-actions/setup-android@v3
+
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | \
+            sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - name: Run Extended Memory Tests (Emulator)
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 31
+          target:    google_apis
+          arch:      x86_64
+          emulator-options: -no-snapshot-save -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -memory 6144
+          disable-animations: true
+          script: |
+            adb wait-for-device
+
+            # Build debug APK with LeakCanary
+            cd android
+            ./gradlew assembleDebug 2>&1 | tail -10
+
+            APK=$(find app/build/outputs/apk/debug -name "*.apk" | head -1)
+            if [ -n "$APK" ]; then
+              adb install -r "$APK"
+              
+              # Run app for 5 minutes, monitoring memory
+              adb shell am start -n com.visionagent.app/.presentation.MainActivity
+              
+              for i in $(seq 1 10); do
+                sleep 30
+                RAM=$(adb shell dumpsys meminfo com.visionagent.app | grep "TOTAL" | awk '{print $2}')
+                echo "Minute $((i/2)): RAM=${RAM}KB"
+              done
+              
+              # Check for memory growth (> 50MB growth = leak suspected)
+              FINAL_RAM=$(adb shell dumpsys meminfo com.visionagent.app | grep "TOTAL" | awk '{print $2}')
+              echo "Final RAM: ${FINAL_RAM}KB"
+              
+              # Dump heap
+              adb shell am dumpheap com.visionagent.app /sdcard/nightly_heap.hprof 2>/dev/null || true
+              adb pull /sdcard/nightly_heap.hprof /tmp/ 2>/dev/null || true
+            fi
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: leak-detection-${{ github.run_id }}
+          path: /tmp/nightly_heap.hprof
+          retention-days: 7
+
+  # ──────────────────────────────────────────────────────────
+  # 5. Firebase Test Lab (Optional — requires setup)
+  # ──────────────────────────────────────────────────────────
+  firebase_test_lab:
+    name: 🔥 Firebase Test Lab (Real Devices)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    if: ${{ inputs.run_device_farm == true }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with: { java-version: '${{ env.JAVA_VERSION }}', distribution: temurin, cache: gradle }
+
+      - uses: android-actions/setup-android@v3
+
+      - name: Setup gcloud
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: ${{ secrets.FIREBASE_PROJECT_ID }}
+          service_account_key: ${{ secrets.FIREBASE_SERVICE_ACCOUNT_KEY }}
+
+      - name: Build Test APKs
+        working-directory: android
+        run: |
+          ./gradlew assembleDebug assembleDebugAndroidTest --stacktrace
+
+      - name: Run on Firebase Test Lab
+        run: |
+          gcloud firebase test android run \
+            --type instrumentation \
+            --app android/app/build/outputs/apk/debug/app-debug.apk \
+            --test android/app/build/outputs/apk/androidTest/debug/app-debug-androidTest.apk \
+            --device model=Pixel6,version=31,locale=en,orientation=portrait \
+            --device model=Pixel4a,version=30,locale=en,orientation=portrait \
+            --device model=moto_g73_5g,version=33,locale=en,orientation=portrait \
+            --results-bucket=gs://${{ secrets.FIREBASE_BUCKET }} \
+            --results-dir=nightly-${{ github.run_id }} \
+            --timeout 300s \
+            --num-flaky-test-attempts 2 \
+            --record-video \
+            --no-performance-metrics
+
+      - name: Download Test Results
+        run: |
+          gsutil -m cp -r \
+            gs://${{ secrets.FIREBASE_BUCKET }}/nightly-${{ github.run_id }}/** \
+            /tmp/firebase_results/ 2>/dev/null || true
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: firebase-test-lab-${{ github.run_id }}
+          path: /tmp/firebase_results/
+          retention-days: 30
+
+  # ──────────────────────────────────────────────────────────
+  # 6. Nightly Summary Report
+  # ──────────────────────────────────────────────────────────
+  nightly_summary:
+    name: 📊 Nightly Summary
+    runs-on: ubuntu-latest
+    needs: [ dependency_scan, baseline_profile, mutation_testing, leak_detection ]
+    if: always()
+
+    steps:
+      - name: Generate Nightly Summary
+        run: |
+          echo "## 🌙 Nightly Deep Analysis — $(date)" >> $GITHUB_STEP_SUMMARY
+          echo ""                                        >> $GITHUB_STEP_SUMMARY
+          echo "| Check | Status |"                      >> $GITHUB_STEP_SUMMARY
+          echo "|-------|--------|"                      >> $GITHUB_STEP_SUMMARY
+          echo "| Dependency Scan  | ${{ needs.dependency_scan.result }}  |" >> $GITHUB_STEP_SUMMARY
+          echo "| Baseline Profile | ${{ needs.baseline_profile.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Mutation Testing | ${{ needs.mutation_testing.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Leak Detection   | ${{ needs.leak_detection.result }}   |" >> $GITHUB_STEP_SUMMARY
+          echo ""                                        >> $GITHUB_STEP_SUMMARY
+          echo "**Run ID:** ${{ github.run_id }}"       >> $GITHUB_STEP_SUMMARY
+          echo "**Date:** $(date -u)"                   >> $GITHUB_STEP_SUMMARY

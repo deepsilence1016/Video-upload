@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    data_extraction_rules.xml
+    Android 12+ (API 31+) backup and data-extraction policy.
+
+    Referenced by AndroidManifest.xml:
+        android:dataExtractionRules="@xml/data_extraction_rules"
+
+    VisionAgent stores crash logs and session data locally.
+    We disable cloud backup entirely — data stays on device.
+-->
+<data-extraction-rules>
+
+    <cloud-backup>
+        <!-- Disable all cloud backup — agent state is device-local -->
+        <exclude domain="root" />
+        <exclude domain="file" />
+        <exclude domain="database" />
+        <exclude domain="sharedpref" />
+        <exclude domain="external" />
+    </cloud-backup>
+
+    <device-transfer>
+        <!-- Disable device-to-device transfer — fresh install preferred -->
+        <exclude domain="root" />
+        <exclude domain="file" />
+        <exclude domain="database" />
+        <exclude domain="sharedpref" />
+        <exclude domain="external" />
+    </device-transfer>
+
+</data-extraction-rules>

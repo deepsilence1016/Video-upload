@@ -1,0 +1,111 @@
+# ================================================================
+# .gitignore — Vision Agent
+# Production repository — only source code, config, docs committed
+# ================================================================
+
+# ── Rust toolchain & cargo ──────────────────────────────────────
+.cargo/
+.rustup/
+rust_engine/target/
+**/*.rs.bk
+
+# ── Gradle & Android build outputs ─────────────────────────────
+.gradle/
+android/.gradle/
+android/build/
+android/app/build/
+android/app/.cxx/
+android/app/src/main/cpp/opencv/
+android/app/src/main/cpp/tesseract/
+android/app/src/main/cpp/leptonica/
+local.properties
+android/local.properties
+
+# ── Signing — NEVER commit keystores ───────────────────────────
+*.keystore
+*.jks
+*.p12
+keystore.properties
+
+# ── Python ─────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+env/
+*.egg-info/
+dist/
+build/
+.coverage
+coverage.xml
+htmlcov/
+
+# ── Node / JS (if any tooling added) ───────────────────────────
+node_modules/
+npm-debug.log*
+yarn-error.log*
+package-lock.json
+
+# ── IDE & editors ───────────────────────────────────────────────
+.idea/
+.vscode/
+*.iml
+*.iws
+*.ipr
+.project
+.classpath
+.settings/
+*.sublime-project
+*.sublime-workspace
+
+# ── OS generated ────────────────────────────────────────────────
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+desktop.ini
+
+# ── Logs & temp ─────────────────────────────────────────────────
+*.log
+*.tmp
+*.temp
+*.bak
+*.swp
+*.swo
+*~
+.tmp/
+tmp/
+temp/
+out/
+dist/
+
+# ── Test & coverage outputs ──────────────────────────────────────
+coverage/
+test-results/
+benchmark-results/
+reports/
+
+# ── Crash dumps ──────────────────────────────────────────────────
+crash_replay/
+*.hprof
+*.dump
+
+# ── Downloaded / generated SDKs (fetched at CI runtime) ─────────
+android/app/src/main/cpp/opencv/
+android/app/src/main/cpp/tesseract/
+android/app/src/main/cpp/leptonica/
+tessdata/
+
+# ── System caches ────────────────────────────────────────────────
+.cache/
+
+# ── Cargo.lock note ──────────────────────────────────────────────
+# rust_engine/Cargo.lock intentionally NOT ignored for reproducible builds
+# (library crates: optional; binary crates: required — we keep it)

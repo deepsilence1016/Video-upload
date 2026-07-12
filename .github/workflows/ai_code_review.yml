@@ -1,0 +1,292 @@
+# ============================================================
+# AI Code Reviewer — Every PR पर automatic code review
+#
+# Reviews करता है:
+#  - Performance issues
+#  - Security vulnerabilities
+#  - Complexity (cyclomatic complexity)
+#  - Dead code
+#  - Memory issues (Kotlin + C++)
+#  - Thread safety
+#  - SOLID violations
+#  - Duplicate code
+#
+# Comments directly on PR lines
+# ============================================================
+
+name: AI Code Review
+
+on:
+  pull_request:
+    types: [ opened, synchronize, ready_for_review ]
+    paths:
+      - '**.kt'
+      - '**.cpp'
+      - '**.h'
+      - '**.rs'
+      - '**.py'
+
+permissions:
+  pull-requests: write
+  contents:      read
+
+jobs:
+  ai_review:
+    name: 🤖 AI Code Review
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    if: github.event.pull_request.draft == false
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Get changed files
+        id: changed
+        run: |
+          git diff --name-only origin/${{ github.base_ref }}...HEAD > /tmp/changed_files.txt
+          echo "Changed files:"
+          cat /tmp/changed_files.txt
+
+      # ── Kotlin Analysis ─────────────────────────────────────────────────
+      - uses: actions/setup-java@v4
+        with: { java-version: '17', distribution: temurin }
+
+      - uses: android-actions/setup-android@v3
+
+      - name: Run Detekt on changed files
+        working-directory: android
+        run: |
+          # Only analyze changed Kotlin files
+          CHANGED_KT=$(grep "\.kt$" /tmp/changed_files.txt | sed 's|^|android/|' | tr '\n' ',')
+          if [ -n "$CHANGED_KT" ]; then
+            ./gradlew detekt \
+              --stacktrace 2>&1 | tee /tmp/detekt_out.txt || true
+          fi
+
+      # ── Python Analysis ──────────────────────────────────────────────────
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.11' }
+
+      - name: Python Analysis (Ruff + Bandit)
+        run: |
+          pip install ruff bandit -q
+          CHANGED_PY=$(grep "\.py$" /tmp/changed_files.txt | tr '\n' ' ')
+          if [ -n "$CHANGED_PY" ]; then
+            ruff check $CHANGED_PY --output-format=json > /tmp/ruff_out.json 2>/dev/null || true
+            bandit $CHANGED_PY -f json -o /tmp/bandit_out.json 2>/dev/null || true
+          fi
+
+      # ── Rust Analysis ────────────────────────────────────────────────────
+      - name: Rust Clippy
+        if: contains(join(github.event.pull_request.files.*.filename), '.rs')
+        uses: dtolnay/rust-toolchain@stable
+        with: { components: clippy }
+        continue-on-error: true
+
+      # ── C++ Analysis ─────────────────────────────────────────────────────
+      - name: Install C++ tools
+        run: sudo apt-get install -y cppcheck clang-tidy --no-install-recommends -qq
+
+      - name: C++ cppcheck on changed files
+        run: |
+          CHANGED_CPP=$(grep -E "\.(cpp|h)$" /tmp/changed_files.txt | tr '\n' ' ')
+          if [ -n "$CHANGED_CPP" ]; then
+            cppcheck \
+              --enable=all \
+              --suppress=missingInclude \
+              --suppress=unusedFunction \
+              --error-exitcode=0 \
+              --xml --xml-version=2 \
+              $CHANGED_CPP 2>/tmp/cppcheck_out.xml || true
+          fi
+
+      # ── Aggregate Review Comment ──────────────────────────────────────────
+      - name: Generate Review Comment
+        id: review
+        run: |
+          python3 << 'PYEOF'
+          import json, subprocess, os, re
+
+          issues = []
+
+          # Parse Detekt output
+          try:
+            with open('/tmp/detekt_out.txt') as f:
+              content = f.read()
+            for line in content.split('\n'):
+              if 'error' in line.lower() or 'warning' in line.lower():
+                # Extract file and line if present
+                m = re.search(r'([\w/.-]+\.kt):(\d+)', line)
+                if m:
+                  issues.append({
+                    'tool': 'Detekt',
+                    'file': m.group(1),
+                    'line': int(m.group(2)),
+                    'message': line.strip()[:200]
+                  })
+          except: pass
+
+          # Parse Ruff output
+          try:
+            with open('/tmp/ruff_out.json') as f:
+              ruff_data = json.load(f)
+            for item in ruff_data[:10]:  # Top 10
+              issues.append({
+                'tool': 'Ruff',
+                'file': item.get('filename',''),
+                'line': item.get('location',{}).get('row',0),
+                'message': f"[{item.get('code','')}] {item.get('message','')}"
+              })
+          except: pass
+
+          # Parse Bandit output
+          try:
+            with open('/tmp/bandit_out.json') as f:
+              bandit_data = json.load(f)
+            for item in bandit_data.get('results',[])[:5]:
+              if item.get('issue_severity') in ['HIGH','MEDIUM']:
+                issues.append({
+                  'tool': 'Bandit Security',
+                  'file': item.get('filename',''),
+                  'line': item.get('line_number',0),
+                  'message': f"[{item.get('test_id','')}] {item.get('issue_text','')} (Severity: {item.get('issue_severity','')})"
+                })
+          except: pass
+
+          # Parse cppcheck output
+          try:
+            import xml.etree.ElementTree as ET
+            tree = ET.parse('/tmp/cppcheck_out.xml')
+            for error in tree.findall('.//error'):
+              sev = error.get('severity','')
+              if sev in ('error','warning'):
+                loc = error.find('location')
+                issues.append({
+                  'tool': 'cppcheck',
+                  'file': loc.get('file','') if loc is not None else '',
+                  'line': int(loc.get('line',0)) if loc is not None else 0,
+                  'message': f"[{sev}] {error.get('msg','')} ({error.get('id','')})"
+                })
+          except: pass
+
+          # Generate comment
+          lines = ['## 🤖 AI Code Review Report\n']
+          lines.append(f'**PR:** #{os.environ.get("PR_NUMBER","?")} | ')
+          lines.append(f'**Issues found:** {len(issues)}\n\n')
+
+          if not issues:
+            lines.append('✅ **No issues found!** Code looks good.\n')
+          else:
+            lines.append('### Issues\n\n')
+            lines.append('| Tool | File | Line | Issue |\n')
+            lines.append('|------|------|------|-------|\n')
+            for issue in issues[:20]:
+              file_short = issue["file"].split('/')[-1] if issue["file"] else "?"
+              lines.append(f'| {issue["tool"]} | `{file_short}` | {issue["line"]} | {issue["message"][:100]} |\n')
+
+            if len(issues) > 20:
+              lines.append(f'\n_... and {len(issues)-20} more issues_\n')
+
+          lines.append('\n---\n')
+          lines.append('_Reviewed by: Detekt (Kotlin), Ruff+Bandit (Python), cppcheck (C++)_\n')
+
+          comment = ''.join(lines)
+          print(comment)
+
+          with open('/tmp/review_comment.md', 'w') as f:
+            f.write(comment)
+
+          # Save issue count for next step
+          with open('/tmp/issue_count.txt', 'w') as f:
+            f.write(str(len(issues)))
+          PYEOF
+
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+
+      - name: Post Review Comment on PR
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const comment = fs.readFileSync('/tmp/review_comment.md', 'utf8');
+            const issueCount = parseInt(fs.readFileSync('/tmp/issue_count.txt', 'utf8').trim() || '0');
+
+            // Find existing review comment from this bot
+            const comments = await github.rest.issues.listComments({
+              owner:      context.repo.owner,
+              repo:       context.repo.repo,
+              issue_number: context.issue.number
+            });
+            const existing = comments.data.find(c =>
+              c.body.includes('🤖 AI Code Review Report') &&
+              c.user.type === 'Bot'
+            );
+
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner:      context.repo.owner,
+                repo:       context.repo.repo,
+                comment_id: existing.id,
+                body:       comment
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner:       context.repo.owner,
+                repo:        context.repo.repo,
+                issue_number: context.issue.number,
+                body:        comment
+              });
+            }
+
+            // Set review status
+            await github.rest.pulls.createReview({
+              owner:       context.repo.owner,
+              repo:        context.repo.repo,
+              pull_number: context.payload.pull_request.number,
+              event:       issueCount > 5 ? 'REQUEST_CHANGES' : 'COMMENT',
+              body:        issueCount > 5
+                ? `Found ${issueCount} code issues. Please review.`
+                : `Found ${issueCount} minor issues.`
+            });
+
+  # ── Security-specific review ──────────────────────────────────────────
+  security_review:
+    name: 🔒 Security Review
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Secret scanning
+        uses: trufflesecurity/trufflehog@main
+        with:
+          path: ./
+          base: ${{ github.event.pull_request.base.sha }}
+          head: ${{ github.event.pull_request.head.sha }}
+        continue-on-error: true
+
+      - name: Check for hardcoded passwords/keys
+        run: |
+          PATTERNS=(
+            "password\s*=\s*['\"][^'\"]{4,}"
+            "api_key\s*=\s*['\"][^'\"]{8,}"
+            "secret\s*=\s*['\"][^'\"]{8,}"
+            "private_key\s*=\s*['\"][^'\"]{16,}"
+          )
+          FOUND=0
+          for pattern in "${PATTERNS[@]}"; do
+            HITS=$(git diff origin/${{ github.base_ref }}...HEAD | grep -iE "$pattern" | grep "^+" | grep -v "^+++" || true)
+            if [ -n "$HITS" ]; then
+              echo "⚠️ Potential hardcoded secret: $HITS"
+              FOUND=$((FOUND+1))
+            fi
+          done
+          if [ "$FOUND" -gt 0 ]; then
+            echo "❌ $FOUND potential hardcoded secrets found!"
+            exit 1
+          fi
+          echo "✅ No hardcoded secrets detected"

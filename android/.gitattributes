@@ -1,0 +1,4 @@
+# Fix: Ensure gradlew is always executable regardless of OS/git config
+gradlew        text eol=lf
+gradlew.bat    text eol=crlf
+*.sh           text eol=lf
